@@ -225,6 +225,11 @@ def get_metrics_rollup(
     allowed_lateness: float = Query(
         default=0.0, ge=0, description="允许的迟到时长（秒），用于计算水位"
     ),
+    calibrated: bool = Query(
+        default=False,
+        description="true 时按每个已提交包 sent_at 生效的校准区间计算统计值，"
+        "无生效配置沿用原始值；false（默认）统计原始值",
+    ),
 ):
     with db.get_conn() as conn:
         dev = conn.execute(
@@ -234,7 +239,14 @@ def get_metrics_rollup(
             raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
         try:
             return compute_rollup(
-                conn, device_id, metric, from_, to, window_seconds, allowed_lateness
+                conn,
+                device_id,
+                metric,
+                from_,
+                to,
+                window_seconds,
+                allowed_lateness,
+                calibrated,
             )
         except RollupError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

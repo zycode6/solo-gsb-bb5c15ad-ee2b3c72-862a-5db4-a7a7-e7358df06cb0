@@ -97,6 +97,11 @@ class RollupResponse(BaseModel):
     to: datetime = Field(description="聚合范围终点（不含）")
     window_seconds: float
     allowed_lateness: float
+    calibrated: bool = Field(
+        default=False,
+        description="统计值是否为校准值：true 时按包 sent_at 生效的校准区间计算，"
+        "无生效配置沿用原始值；false 时始终为原始值",
+    )
     watermark: Optional[datetime] = Field(
         default=None,
         description="设备已提交数据的最大 sent_at 减 allowed_lateness；无数据时为 null",

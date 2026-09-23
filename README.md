@@ -7,7 +7,7 @@
 - **可观测接口**：查询每台设备的缺口、已提交序号与重复包记录；
 - **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；
 - **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
-- **设备指标校准**：按设备 + 指标维护线性校准配置（`校准值 = 原始值 × scale + offset`），有效时间段互不重叠（事务内校验），按时刻解析唯一生效配置并计算校准值，不改写已存原始测量。
+- **设备指标校准**：按设备 + 指标维护线性校准配置（`校准值 = 原始值 × scale + offset`），有效时间段互不重叠（事务内校验），按时刻解析唯一生效配置并计算校准值，不改写已存原始测量；窗口聚合支持可选的校准值模式（`calibrated=true`），按每个已提交包的 `sent_at` 解析当时生效的校准区间计算统计值，无配置沿用原始值。
 - **只读归档导出**：按设备 + seq 范围创建一次性导出任务，返回 NDJSON 分页游标与 manifest（包数、首尾序号、规范化内容 SHA-256），快照不可变、续传字节稳定，并提供摘要校验接口；导出不触碰提交、缓冲、重复与告警数据。
 
 ## 快速开始
@@ -81,7 +81,7 @@ pytest tests/
 | GET | `/api/v1/devices/{id}/gaps` | 缺口：缓冲区序号与缺失序号 |
 | GET | `/api/v1/devices/{id}/committed` | 已提交序号（支持 `from_seq`/`to_seq`/`limit`/`offset`） |
 | GET | `/api/v1/devices/{id}/duplicates` | 重复包记录（可按 `reason` 过滤） |
-| GET | `/api/v1/devices/{id}/metrics/rollup` | 按事件时间的窗口聚合（count/min/max/mean + 水位迟到统计） |
+| GET | `/api/v1/devices/{id}/metrics/rollup` | 按事件时间的窗口聚合（count/min/max/mean + 水位迟到统计，可选 `calibrated=true` 校准值口径） |
 | POST | `/api/v1/rules` | 创建阈值告警规则（按 设备+指标 唯一） |
 | GET | `/api/v1/rules` | 规则列表（可按 `device_id`/`metric` 过滤） |
 | GET | `/api/v1/rules/{rule_id}` | 规则详情 |
@@ -106,6 +106,7 @@ pytest tests/
 | `from` / `to` | 是 | 聚合范围 `[from, to)`，ISO 8601（不带时区按 UTC 处理） |
 | `window_seconds` | 是 | 窗口宽度（秒），必须为正 |
 | `allowed_lateness` | 否 | 允许的迟到时长（秒），默认 `0` |
+| `calibrated` | 否 | 是否按校准值统计：`true` / `false`（`1`/`0`、`yes`/`no` 亦可），默认 `false` 统计原始值 |
 
 语义：
 
@@ -113,16 +114,24 @@ pytest tests/
 - **水位** `watermark = 设备已提交包的最大 sent_at - allowed_lateness`（设备级，与查询的指标、时间范围无关）；
 - 迟到判定发生在**包提交时刻**：按提交顺序重放，若某包的 `sent_at` 早于当时水位，其样本为迟到样本——计入 `late_count`，**不改写已关闭窗口**的统计；
 - 缓冲区中尚未提交的包不参与聚合；无 `sent_at` 的包无法分窗，跳过；
+- **校准值模式**（`calibrated=true`）：对每个已提交包按其 **`sent_at`** 解析该（设备，指标）在该时刻唯一生效的校准区间，以 `校准值 = 原始值 × scale + offset` 参与 count/min/max/mean 统计；该时刻无生效配置（区间之前 / 之后 / 从未配置）时**沿用原始值**。响应中回显 `"calibrated": true`。迟到样本在任何模式下都只计入 `late_count`，**不解析校准、不入窗**；校准只在查询时计算，已存测量与归档导出始终保持原始值（见下文校准章节）；
 - 单次查询窗口数上限 10000，超出返回 `422`（请增大 `window_seconds` 或缩小范围）。
 
 示例：
 
 ```bash
+# 默认：统计原始值
 curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/rollup?metric=temperature&from=2026-09-22T08:00:00Z&to=2026-09-22T09:00:00Z&window_seconds=300&allowed_lateness=60'
 # => {"device_id":"ph-meter-01","metric":"temperature","from":"...","to":"...",
-#     "window_seconds":300.0,"allowed_lateness":60.0,
+#     "window_seconds":300.0,"allowed_lateness":60.0,"calibrated":false,
 #     "watermark":"2026-09-22T08:59:00Z","late_count":0,
 #     "windows":[{"start":"...","end":"...","count":3,"min":21.0,"max":21.6,"mean":21.3}, ...]}
+
+# 校准值模式：按每个包 sent_at 当时生效的校准区间计算
+curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/rollup?metric=temperature&from=2026-09-22T08:00:00Z&to=2026-09-22T09:00:00Z&window_seconds=300&calibrated=true'
+# => {..., "calibrated":true,
+#     "windows":[{"start":"...","end":"...","count":3,"min":21.92,"max":22.532,"mean":22.226}, ...]}
+# （示例配置 scale=1.02、offset=0.5；无生效配置的包仍按原始值计入同一窗口）
 ```
 
 ## 阈值告警（Threshold Alerts）
@@ -218,8 +227,9 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/alerts/events?metric=temperature
 同一 (设备, 指标) 的有效区间**不得重叠**——创建时在同一事务内完成重叠校验与写入，
 重叠返回 `409`，因此任意时刻至多一条配置生效。
 
-校准只在查询时计算，**不改写已存储的原始测量**：已提交数据、窗口聚合与归档导出
-始终保持原始值。
+校准只在查询时计算，**不改写已存储的原始测量**：已提交数据、归档导出始终保持
+原始值；窗口聚合默认（`calibrated=false`）同样统计原始值，仅在显式传
+`calibrated=true` 时按校准值统计（见「窗口聚合」一节）。
 
 ### 创建配置
 
@@ -267,6 +277,41 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/calibrations/resolve?metric=temp
 ```
 
 无生效配置时 HTTP 仍为 `200`，`calibration` 与 `calibrated_value` 均为 `null`。
+
+### 窗口聚合的校准值模式（calibrated=true）
+
+窗口聚合接口 `GET /api/v1/devices/{device_id}/metrics/rollup` 额外支持布尔查询参数
+`calibrated`（默认 `false`）：
+
+- `false` / 缺省：count / min / max / mean 全部基于**原始值**，与校准配置是否存在无关；
+- `true`：服务把该（设备，指标）的全部校准区间一次性载入，对**每个已提交包**按其
+  `sent_at` 二分解析当时唯一生效的区间（边界同样是 `[valid_from, valid_to)`），
+  包内该指标的每个测量值统一按 `原始值 × scale + offset` 转换后再入窗；该包
+  `sent_at` 时刻无生效配置时，包内样本**沿用原始值**——因此同一窗口中可能既有
+  校准值（命中配置的包）也有原始值（未命中的包）。
+
+其余语义保持不变：
+
+- 迟到样本仍只计入 `late_count`，不解析校准、不进入任何窗口，已关闭窗口的统计不被改写；
+- 校准只发生在本次查询期间，可任意重复调用；**已存测量与归档导出（NDJSON / manifest
+  摘要）始终是原始值**，水位、窗口划分与 `late_count` 也与原始值模式完全一致；
+- 响应体回显 `"calibrated": true|false`，便于下游区分两种口径。
+
+```bash
+# 先配置一段生效区间
+curl -X POST localhost:8000/api/v1/calibrations -H 'Content-Type: application/json' -d '{
+  "device_id": "ph-meter-01", "metric": "temperature",
+  "valid_from": "2026-09-01T00:00:00Z", "valid_to": "2026-10-01T00:00:00Z",
+  "offset": 0.5, "scale": 1.02
+}'
+
+# 原始值口径（默认）
+curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/rollup?metric=temperature&from=2026-09-22T08:00:00Z&to=2026-09-22T09:00:00Z&window_seconds=300'
+# 校准值口径：21.4 -> 21.4*1.02+0.5 = 22.328
+curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/rollup?metric=temperature&from=2026-09-22T08:00:00Z&to=2026-09-22T09:00:00Z&window_seconds=300&calibrated=true'
+# => {"device_id":"ph-meter-01", ..., "calibrated":true,
+#     "windows":[{"start":"...","end":"...","count":3,"min":21.92,"max":22.532,"mean":22.226}, ...]}
+```
 
 ## 只读归档导出（Exports）
 
@@ -388,8 +433,8 @@ app/
   main.py         # FastAPI 路由
   logic.py        # 摄入核心：幂等判定、缓冲、排水提交（提交时驱动告警评估）
   alerts.py       # 阈值告警：规则 CRUD、带连续计数的迟滞状态机、按提交顺序评估
-  calibrations.py # 设备指标校准：有效区间不重叠校验、按时刻解析与线性校准计算
-  rollup.py       # 窗口聚合：半开窗口分桶、水位迟到判定
+  calibrations.py # 设备指标校准：有效区间不重叠校验、按时刻解析与线性校准计算（含区间索引供聚合批量解析）
+  rollup.py       # 窗口聚合：半开窗口分桶、水位迟到判定、可选校准值口径
   exports.py      # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验
   db.py           # SQLite 连接与建表（启动时自动执行）
   schemas.py      # Pydantic 模型

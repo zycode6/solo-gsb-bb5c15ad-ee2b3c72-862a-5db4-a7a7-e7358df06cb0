@@ -10,7 +10,11 @@
 - 迟到判定发生在包提交时刻：按提交顺序重放，若某包的 sent_at 早于
   此前已见过的最大 sent_at 所构成的水位，则其样本为迟到样本——
   计入 late_count，不得改写已关闭窗口的统计；
-- 窗口按 start 升序稳定返回，空窗口 count=0、统计值为 null。
+- 窗口按 start 升序稳定返回，空窗口 count=0、统计值为 null；
+- calibrated=False（默认）时统计原始值；calibrated=True 时，对每个
+  已提交包按其 sent_at 解析该 (设备, 指标) 当时唯一生效的校准区间，
+  以 校准值 = 原始值 * scale + offset 参与统计；该时刻无生效配置则
+  沿用原始值。校准只在本次查询中计算，不改写已存测量，也不影响导出。
 """
 
 import json
@@ -19,6 +23,11 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Iterator, List, Optional, Tuple
 
+from .calibrations import (
+    apply_calibration,
+    load_calibration_index,
+    normalize_instant,
+)
 from .schemas import RollupResponse, RollupWindow
 
 # 单次查询允许的最大窗口数，防止时间跨度过大导致响应爆炸
@@ -66,14 +75,25 @@ def compute_rollup(
     to: datetime,
     window_seconds: float,
     allowed_lateness: float,
+    calibrated: bool = False,
 ) -> RollupResponse:
-    """对单台设备的已提交测量按 sent_at 分窗聚合。调用方需保证设备存在。"""
+    """对单台设备的已提交测量按 sent_at 分窗聚合。调用方需保证设备存在。
+
+    calibrated=True 时按每个已提交包的 sent_at 解析生效校准区间并计算
+    校准值（无生效配置沿用原始值）；迟到样本只计入 late_count，校准与否
+    都不改写窗口统计。
+    """
     from_ = _as_utc(from_)
     to = _as_utc(to)
     if from_ >= to:
         raise RollupError("参数 from 必须早于 to")
     if allowed_lateness < 0:
         raise RollupError("allowed_lateness 不能为负数")
+
+    # 校准模式下一次性载入该 (设备, 指标) 的全部区间，按包 sent_at 二分解析
+    calibration_index = (
+        load_calibration_index(conn, device_id, metric) if calibrated else None
+    )
 
     # 用整数微秒计算窗口边界与归属，避免浮点误差把边界样本放错窗口
     window_us = round(window_seconds * _US_PER_SECOND)
@@ -101,6 +121,15 @@ def compute_rollup(
                 # 水位之前到达：窗口已关闭，只计数不改写
                 late_count += len(values)
             else:
+                if calibration_index is not None:
+                    interval = calibration_index.resolve(
+                        normalize_instant(sent_at)
+                    )
+                    if interval is not None:
+                        values = [
+                            apply_calibration(v, interval.scale, interval.offset)
+                            for v in values
+                        ]
                 offset_us = round((sent_at - from_).total_seconds() * _US_PER_SECOND)
                 buckets[offset_us // window_us].extend(values)
         if max_sent_at is None or sent_at > max_sent_at:
@@ -133,6 +162,7 @@ def compute_rollup(
         to=to,
         window_seconds=window_seconds,
         allowed_lateness=allowed_lateness,
+        calibrated=calibrated,
         watermark=watermark,
         late_count=late_count,
         windows=windows,

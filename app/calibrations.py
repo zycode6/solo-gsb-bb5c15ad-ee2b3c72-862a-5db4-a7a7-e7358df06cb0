@@ -7,13 +7,48 @@
 - 校准只在 resolve 查询时计算，已存储的原始测量不被改写。
 """
 
+import bisect
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, NamedTuple, Optional
 
 # valid_to 为 null（无限期）时参与区间比较的远端哨兵时间；
 # 与存储格式同为固定微秒宽度的 UTC ISO 字符串，字典序即时间序
 _FAR_FUTURE = "9999-12-31T23:59:59.999999Z"
+
+
+class CalibrationInterval(NamedTuple):
+    """供批量时刻解析使用的一条校准区间（时间已归一化为固定宽度字符串）。"""
+
+    valid_from: str
+    valid_to: Optional[str]
+    scale: float
+    offset: float
+
+
+class CalibrationIndex:
+    """某 (设备, 指标) 校准区间的只读快照，支持按时刻批量解析。
+
+    区间互不重叠，按 valid_from 排序后，at 时刻生效的配置至多一条，
+    用二分定位即可，避免窗口聚合重放提交时逐包查询数据库。
+    """
+
+    def __init__(self, intervals: List[CalibrationInterval]):
+        self._intervals = sorted(intervals, key=lambda i: i.valid_from)
+        self._starts = [i.valid_from for i in self._intervals]
+
+    def __len__(self) -> int:
+        return len(self._intervals)
+
+    def resolve(self, instant: str) -> Optional[CalibrationInterval]:
+        """返回 instant（固定宽度 UTC 字符串）时刻生效的区间；无则 None。"""
+        idx = bisect.bisect_right(self._starts, instant) - 1
+        if idx < 0:
+            return None
+        interval = self._intervals[idx]
+        if interval.valid_to is not None and instant >= interval.valid_to:
+            return None
+        return interval
 
 
 class CalibrationError(ValueError):
@@ -102,6 +137,34 @@ def resolve_calibration(
         """,
         (device_id, metric, instant, _FAR_FUTURE, instant),
     ).fetchone()
+
+
+def load_calibration_index(
+    conn: sqlite3.Connection, device_id: str, metric: str
+) -> CalibrationIndex:
+    """一次性载入某 (设备, 指标) 的全部校准区间，供窗口聚合按 sent_at 批量解析。
+
+    区间在创建时已保证互不重叠；返回的索引只在当前查询内使用。
+    """
+    rows = conn.execute(
+        """
+        SELECT valid_from, valid_to, scale, offset FROM calibrations
+         WHERE device_id = ? AND metric = ?
+         ORDER BY valid_from
+        """,
+        (device_id, metric),
+    ).fetchall()
+    return CalibrationIndex(
+        [
+            CalibrationInterval(
+                valid_from=r["valid_from"],
+                valid_to=r["valid_to"],
+                scale=r["scale"],
+                offset=r["offset"],
+            )
+            for r in rows
+        ]
+    )
 
 
 def apply_calibration(value: float, scale: float, offset: float) -> float:
