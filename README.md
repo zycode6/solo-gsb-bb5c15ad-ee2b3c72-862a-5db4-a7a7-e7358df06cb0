@@ -5,7 +5,7 @@
 - **幂等去重**：每个包携带幂等键，重试 / 重发不会产生重复数据或重复告警事件；
 - **乱序缓冲**：序号不连续的包先暂存，缺口补齐后**按序连续提交**（告警也按该提交顺序评估）；
 - **可观测接口**：查询每台设备的缺口、已提交序号与重复包记录；
-- **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；
+- **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；默认统计原始值，可选按包 `sent_at` 时刻生效的校准配置输出校准值统计；
 - **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
 - **设备指标校准**：按设备 + 指标维护线性校准配置（`校准值 = 原始值 × scale + offset`），有效时间段互不重叠（事务内校验），按时刻解析唯一生效配置并计算校准值，不改写已存原始测量。
 - **只读归档导出**：按设备 + seq 范围创建一次性导出任务，返回 NDJSON 分页游标与 manifest（包数、首尾序号、规范化内容 SHA-256），快照不可变、续传字节稳定，并提供摘要校验接口；导出不触碰提交、缓冲、重复与告警数据。
@@ -81,7 +81,7 @@ pytest tests/
 | GET | `/api/v1/devices/{id}/gaps` | 缺口：缓冲区序号与缺失序号 |
 | GET | `/api/v1/devices/{id}/committed` | 已提交序号（支持 `from_seq`/`to_seq`/`limit`/`offset`） |
 | GET | `/api/v1/devices/{id}/duplicates` | 重复包记录（可按 `reason` 过滤） |
-| GET | `/api/v1/devices/{id}/metrics/rollup` | 按事件时间的窗口聚合（count/min/max/mean + 水位迟到统计） |
+| GET | `/api/v1/devices/{id}/metrics/rollup` | 按事件时间的窗口聚合（count/min/max/mean + 水位迟到统计，可选 `calibrated=true` 输出校准值） |
 | POST | `/api/v1/rules` | 创建阈值告警规则（按 设备+指标 唯一） |
 | GET | `/api/v1/rules` | 规则列表（可按 `device_id`/`metric` 过滤） |
 | GET | `/api/v1/rules/{rule_id}` | 规则详情 |
@@ -106,12 +106,15 @@ pytest tests/
 | `from` / `to` | 是 | 聚合范围 `[from, to)`，ISO 8601（不带时区按 UTC 处理） |
 | `window_seconds` | 是 | 窗口宽度（秒），必须为正 |
 | `allowed_lateness` | 否 | 允许的迟到时长（秒），默认 `0` |
+| `calibrated` | 否 | 是否按校准值统计：`true` 时以每个包 `sent_at` 时刻生效的校准配置变换后统计，默认 `false`（原始值） |
 
 语义：
 
 - 窗口是以 `from` 为锚点的**半开区间** `[from + k·w, from + (k+1)·w)`，覆盖 `[from, to)`；窗口按 `start` 升序稳定返回，空窗口 `count=0` 且统计值为 `null`；
 - **水位** `watermark = 设备已提交包的最大 sent_at - allowed_lateness`（设备级，与查询的指标、时间范围无关）；
 - 迟到判定发生在**包提交时刻**：按提交顺序重放，若某包的 `sent_at` 早于当时水位，其样本为迟到样本——计入 `late_count`，**不改写已关闭窗口**的统计；
+- **校准模式**（`calibrated=true`）：每个入窗包按其 `sent_at` 查找该 (设备, 指标) 在该时刻唯一生效的校准区间（边界 `[valid_from, valid_to)`，复用 [校准配置](#设备指标校准calibrations)），包内该指标的全部测量值统一按 `校准值 = 原始值 × scale + offset` 变换后再计算 count / min / max / mean；该时刻无生效配置（或该设备 / 指标根本没有配置）时**沿用原始值**；同一窗口内可以混合"已校准"与"原始"样本；
+- 校准只在本次查询内计算：**迟到样本仍只计入 `late_count`，既不入窗也不解析校准**；`count`、水位与迟到判定不受影响；已存储的原始测量、归档导出内容始终保持原始值，默认（不带参数或 `calibrated=false`）聚合结果也不变，响应中以 `calibrated` 字段回显本次模式；
 - 缓冲区中尚未提交的包不参与聚合；无 `sent_at` 的包无法分窗，跳过；
 - 单次查询窗口数上限 10000，超出返回 `422`（请增大 `window_seconds` 或缩小范围）。
 
@@ -120,10 +123,32 @@ pytest tests/
 ```bash
 curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/rollup?metric=temperature&from=2026-09-22T08:00:00Z&to=2026-09-22T09:00:00Z&window_seconds=300&allowed_lateness=60'
 # => {"device_id":"ph-meter-01","metric":"temperature","from":"...","to":"...",
-#     "window_seconds":300.0,"allowed_lateness":60.0,
+#     "window_seconds":300.0,"allowed_lateness":60.0,"calibrated":false,
 #     "watermark":"2026-09-22T08:59:00Z","late_count":0,
 #     "windows":[{"start":"...","end":"...","count":3,"min":21.0,"max":21.6,"mean":21.3}, ...]}
 ```
+
+### 校准值模式（可选）
+
+先按 [设备指标校准](#设备指标校准calibrations) 为 `ph-meter-01` 的 `temperature` 配置一段
+9 月生效的校准（`scale=1.02, offset=0.5`），随后聚合时加 `calibrated=true`：
+
+```bash
+# 原始值（默认，行为与旧版本完全一致）
+curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/rollup?metric=temperature&from=2026-09-22T08:00:00Z&to=2026-09-22T09:00:00Z&window_seconds=300'
+
+# 校准值：每个包按自身 sent_at 解析生效配置，21.4 → 21.4 × 1.02 + 0.5 = 22.328
+curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/rollup?metric=temperature&from=2026-09-22T08:00:00Z&to=2026-09-22T09:00:00Z&window_seconds=300&calibrated=true'
+# => {"device_id":"ph-meter-01","metric":"temperature","calibrated":true,
+#     "window_seconds":300.0,"allowed_lateness":0.0,"watermark":"...","late_count":0,
+#     "windows":[{"start":"...","end":"...","count":3,"min":21.92,"max":22.532,"mean":22.226}, ...]}
+```
+
+要点：
+
+- 每个包**只按自己的 `sent_at`** 解析一次配置：包落在配置生效区间外（或该 设备+指标 无配置）时，该包样本沿用原始值；两段配置相接时边界按半开区间 `[valid_from, valid_to)` 归属；
+- 迟到样本在任何模式下都**只计入 `late_count`**，不会以校准值身份补进已关闭窗口；
+- 该参数是纯查询选项：不新建表、不写库，导出（NDJSON/摘要）与已存测量保持原始值，同一查询随时可在两种模式间切换。
 
 ## 阈值告警（Threshold Alerts）
 
@@ -218,8 +243,9 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/alerts/events?metric=temperature
 同一 (设备, 指标) 的有效区间**不得重叠**——创建时在同一事务内完成重叠校验与写入，
 重叠返回 `409`，因此任意时刻至多一条配置生效。
 
-校准只在查询时计算，**不改写已存储的原始测量**：已提交数据、窗口聚合与归档导出
-始终保持原始值。
+校准只在查询时计算，**不改写已存储的原始测量**：已提交数据与归档导出
+始终保持原始值；窗口聚合默认也统计原始值，仅在显式传 `calibrated=true` 时
+按查询时解析的校准配置输出校准值统计（见[窗口聚合](#窗口聚合rollup)）。
 
 ### 创建配置
 
